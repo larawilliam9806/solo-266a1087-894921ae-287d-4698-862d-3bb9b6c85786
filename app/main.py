@@ -9,6 +9,14 @@
 - 空白样的扣减值与方差可另行登记、更正。
 - 新汇总可凭样组号、已有汇总号或两者组合生成；重叠样组只计一次。
   引用旧汇总时展开为其样组集合，按**当前**空白样数据重算。
+- 续算优化：请求只引用一份汇总（不另给样组）时，直接读取该汇总底稿
+  的成员编号与存量聚合，无需展开其全部样组；逐组读数总和、独立测量
+  方差之和及空白样用量，只从去重后**新增**的样组读取。引用多份汇总
+  时仍按实际样组展开去重。
+- 升级前生成、没有存量聚合的汇总，首次成功被引用为底稿时按其原组
+  补读一次并落盘；重启后直接复用，不再补读。
+- 存量聚合以精确有理数分量（分子/分母）保存，续算与“同一批样组从头
+  核算”在位级上完全一致，读数正负抵消时亦然。
 - 校正均值 = (读数总和 − Σ 空白扣减值 × 该空白总使用次数) / 测量总数
 - 标准误   = sqrt(Σ 空白方差 × 该空白总使用次数² + 独立测量方差之和) / 测量总数
 - 查询旧汇总时返回原结果与当时采用的空白样数据（快照）。
@@ -21,6 +29,7 @@ import math
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from fractions import Fraction
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -86,7 +95,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="浓度汇总 API",
-    version="1.0.0",
+    version="1.1.0",
     description="河段水质报告浓度汇总：样组登记、空白样登记/更正、汇总生成与查询。",
     lifespan=lifespan,
 )
@@ -101,6 +110,109 @@ def get_db():
 
 
 Db = Annotated[sqlite3.Connection, Depends(get_db)]
+
+
+# ---------------------------------------------------------------- 精确聚合
+
+def frac_of(value: float) -> Fraction:
+    """把登记的浮点读数精确转成有理数（按其二进制位值，无额外舍入）。"""
+    if not math.isfinite(value):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "non_finite_value",
+                "message": "读数、方差或空白样数据含无穷/非数值，无法汇总。",
+            },
+        )
+    return Fraction(value)
+
+
+def group_aggregate(g: dict[str, Any]) -> dict[str, Any]:
+    """从一个样组读取逐组统计（只对去重后需要读取的样组调用）。"""
+    return {
+        "reading": frac_of(g["reading_sum"]),
+        "variance": frac_of(g["variance_sum"]),
+        "usage": dict(g["blank_usages"]),
+    }
+
+
+def merge_usage(into: dict[str, int], extra: dict[str, int]) -> None:
+    for blank_id, count in extra.items():
+        into[blank_id] = into.get(blank_id, 0) + count
+
+
+def get_aggregate(db: sqlite3.Connection, summary_id: int) -> dict[str, Any] | None:
+    """读取汇总的存量聚合缓存；不存在返回 None（升级前的旧汇总）。"""
+    row = db.execute(
+        "SELECT reading_num, reading_den, variance_num, variance_den, "
+        "blank_usages_json, backfilled "
+        "FROM summary_aggregates WHERE summary_id = ?",
+        (summary_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "reading": Fraction(int(row["reading_num"]), int(row["reading_den"])),
+        "variance": Fraction(int(row["variance_num"]), int(row["variance_den"])),
+        "usage": json.loads(row["blank_usages_json"]),
+        "backfilled": bool(row["backfilled"]),
+    }
+
+
+def put_aggregate(
+    db: sqlite3.Connection,
+    summary_id: int,
+    reading: Fraction,
+    variance: Fraction,
+    usage: dict[str, int],
+    backfilled: bool,
+) -> None:
+    # 分子/分母以十进制字符串保存：极大浮点的精确分数分量可能超过 64 位整数
+    db.execute(
+        "INSERT INTO summary_aggregates "
+        "(summary_id, reading_num, reading_den, variance_num, variance_den, "
+        " blank_usages_json, backfilled) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            summary_id,
+            str(reading.numerator), str(reading.denominator),
+            str(variance.numerator), str(variance.denominator),
+            json.dumps(usage, sort_keys=True), 1 if backfilled else 0,
+        ),
+    )
+
+
+def _backfill_aggregate(db: sqlite3.Connection, summary_id: int) -> dict[str, Any]:
+    """按汇总原组在内存补读一次统计（不落盘）。
+
+    样组登记后固定，补读数据与该汇总当时核算所用数据一致。返回结果由调用方
+    在“本次汇总成功生成”的写事务内通过 put_aggregate 落盘；若后续校验失败、
+    本次不生成汇总，事务回滚后下次引用仍会重新补读。落盘后跨重启直接复用。
+    """
+    reading = Fraction(0)
+    variance = Fraction(0)
+    usage: dict[str, int] = {}
+    for row in db.execute(
+        "SELECT g.group_id, g.reading_sum, g.variance_sum "
+        "FROM summary_groups sg "
+        "JOIN sample_groups g ON g.group_id = sg.group_id "
+        "WHERE sg.summary_id = ? ORDER BY g.group_id",
+        (summary_id,),
+    ):
+        reading += frac_of(row["reading_sum"])
+        variance += frac_of(row["variance_sum"])
+        for u in db.execute(
+            "SELECT blank_id, usage_count FROM group_blank_usages "
+            "WHERE group_id = ? ORDER BY blank_id",
+            (row["group_id"],),
+        ):
+            usage[u["blank_id"]] = usage.get(u["blank_id"], 0) + u["usage_count"]
+
+    return {
+        "reading": reading,
+        "variance": variance,
+        "usage": usage,
+        "backfilled": True,
+    }
 
 
 # ---------------------------------------------------------------- 读取辅助
@@ -324,8 +436,12 @@ def list_blanks(db: Db) -> list[dict[str, Any]]:
 def create_summary(body: SummaryRequest, db: Db) -> dict[str, Any]:
     """凭样组号、已有汇总号或两者组合生成汇总。
 
-    - 重叠样组只计一次；
-    - 引用旧汇总时展开为其样组集合，按**当前**空白样数据重算；
+    - 重叠样组只计一次；引用旧汇总时按**当前**空白样数据重算；
+    - 请求只引用一份汇总时走续算：底稿只读取其成员编号与存量聚合，
+      不展开底稿样组；逐组统计（读数总和、独立测量方差之和、空白样
+      用量）只从去重后**新增**的样组读取；
+    - 引用多份汇总时仍按实际样组展开去重，每个样组仍可单独查询和汇总；
+    - 升级前的汇总首次成功用作底稿时补读一次原组统计，重启后复用；
     - 资料缺失时返回所缺编号（404），本次不生成汇总；
     - 指标 / 单位不一致时返回 409。
     """
@@ -348,20 +464,86 @@ def create_summary(body: SummaryRequest, db: Db) -> dict[str, Any]:
             summary_ids=missing_summary_ids, group_ids=missing_group_ids
         )
 
-    # 3) 展开旧汇总为其样组集合，与直接样组取并集 —— 重叠样组只计一次
-    group_ids: set[str] = set(direct_group_ids)
-    for sid in summary_ids:
-        rows = db.execute(
-            "SELECT group_id FROM summary_groups WHERE summary_id = ?", (sid,)
-        ).fetchall()
-        group_ids.update(r["group_id"] for r in rows)
+    # 3) 决定取数路径。
+    #    续算快路径：请求只引用一份汇总——底稿只需读取其成员编号与存量
+    #    聚合，不展开底稿样组；逐组统计只从去重后**新增**的样组读取。
+    incremental = len(summary_ids) == 1
+    base_summary_id = summary_ids[0] if incremental else None
 
-    groups = [group_payload(db, g) for g in sorted(group_ids)]
+    # 去重后实际收录的样组编号
+    group_ids: set[str] = set(direct_group_ids)
+    # 指标/单位 -> 该组合下的样组编号（用于 409 明细，沿用原返回格式）
+    combos: dict[tuple[str, str], list[str]] = {}
+    # 精确存量：读数总和、独立测量方差之和、各空白样用量
+    reading_exact = Fraction(0)
+    variance_exact = Fraction(0)
+    usage: dict[str, int] = {}
+    # 升级前底稿的补读结果（内存），随本次成功生成的汇总一起落盘
+    backfilled: list[dict[str, Any]] = []
+    # 快路径下底稿已收录的样组；直接给出的样组若与底稿重叠则不算新增
+    base_group_set: set[str] = set()
+
+    if incremental:
+        # 3a) 单底稿续算：成员编号直接读底稿，底稿逐组统计一份都不展开
+        base_row = db.execute(
+            "SELECT analyte, unit FROM summaries WHERE summary_id = ?",
+            (base_summary_id,),
+        ).fetchone()
+        base_groups = [
+            r["group_id"]
+            for r in db.execute(
+                "SELECT group_id FROM summary_groups "
+                "WHERE summary_id = ? ORDER BY group_id",
+                (base_summary_id,),
+            )
+        ]
+        base_group_set = set(base_groups)
+        group_ids.update(base_groups)
+        combos.setdefault(
+            (base_row["analyte"], base_row["unit"]), []
+        ).extend(base_groups)
+
+        cached = get_aggregate(db, base_summary_id)
+        if cached is None:
+            # 升级前的汇总首次成功用作底稿：先按原组在内存补读一次，
+            # 缓存写入推迟到第 7 步的写事务内（成功才落盘、失败可重补）
+            agg = _backfill_aggregate(db, base_summary_id)
+            backfilled.append({"summary_id": base_summary_id, "agg": agg})
+        else:
+            agg = cached
+        reading_exact += agg["reading"]
+        variance_exact += agg["variance"]
+        merge_usage(usage, agg["usage"])
+
+        # 只对去重后新增的样组读取逐组统计（与底稿重叠的直接样组跳过）
+        new_groups = [
+            group_payload(db, g)
+            for g in sorted(set(direct_group_ids) - base_group_set)
+        ]
+        for g in new_groups:
+            combos.setdefault((g["analyte"], g["unit"]), []).append(g["group_id"])
+            ga = group_aggregate(g)
+            reading_exact += ga["reading"]
+            variance_exact += ga["variance"]
+            merge_usage(usage, ga["usage"])
+    else:
+        # 3b) 常规路径：引用多份汇总（或不引用汇总）时，按实际样组展开去重
+        for sid in summary_ids:
+            rows = db.execute(
+                "SELECT group_id FROM summary_groups WHERE summary_id = ?", (sid,)
+            ).fetchall()
+            group_ids.update(r["group_id"] for r in rows)
+
+        groups = [group_payload(db, g) for g in sorted(group_ids)]
+        for g in groups:
+            combos.setdefault((g["analyte"], g["unit"]), []).append(g["group_id"])
+            # 逐组统计只从去重后实际收录的样组读取（每个样组只读一次）
+            ga = group_aggregate(g)
+            reading_exact += ga["reading"]
+            variance_exact += ga["variance"]
+            merge_usage(usage, ga["usage"])
 
     # 4) 只处理同一指标、同一单位的读数
-    combos: dict[tuple[str, str], list[str]] = {}
-    for g in groups:
-        combos.setdefault((g["analyte"], g["unit"]), []).append(g["group_id"])
     if len(combos) > 1:
         raise HTTPException(
             status_code=409,
@@ -376,13 +558,7 @@ def create_summary(body: SummaryRequest, db: Db) -> dict[str, Any]:
         )
     (analyte, unit), _ = next(iter(combos.items()))
 
-    # 5) 汇总各空白样的总使用次数
-    usage: dict[str, int] = {}
-    for g in groups:
-        for b, c in g["blank_usages"].items():
-            usage[b] = usage.get(b, 0) + c
-
-    # 6) 取当前空白样资料；缺失则列出所缺编号，本次不生成汇总
+    # 5) 取当前空白样资料；缺失则列出所缺编号，本次不生成汇总
     blanks: dict[str, sqlite3.Row] = {}
     missing_blank_ids: list[str] = []
     for b in sorted(usage):
@@ -396,25 +572,35 @@ def create_summary(body: SummaryRequest, db: Db) -> dict[str, Any]:
     if missing_blank_ids:
         raise missing_data_error(blank_ids=missing_blank_ids)
 
-    # 7) 计算
-    reading_sum = math.fsum(g["reading_sum"] for g in groups)
-    variance_sum = math.fsum(g["variance_sum"] for g in groups)
+    # 6) 计算。全部以精确有理数合并，最后一步正确舍入成 float，
+    #    与“同一批样组从头核算”位级一致（含读数正负抵消）。
     total_measurements = sum(usage.values())  # 每次测量只用一份空白样
     if total_measurements <= 0:
         raise HTTPException(
             status_code=422,
             detail={"error": "no_measurements", "message": "测量总数为零，无法汇总。"},
         )
-    blank_deduction_total = math.fsum(
-        blanks[b]["deduction"] * n for b, n in usage.items()
-    )
-    corrected_mean = (reading_sum - blank_deduction_total) / total_measurements
-    total_variance = variance_sum + math.fsum(
-        blanks[b]["variance"] * n * n for b, n in usage.items()
-    )
-    standard_error = math.sqrt(total_variance) / total_measurements
 
-    # 8) 写入汇总及当时采用的空白样数据快照
+    blank_deduction_exact = sum(
+        (frac_of(blanks[b]["deduction"]) * n for b, n in usage.items()),
+        Fraction(0),
+    )
+    blank_variance_exact = sum(
+        (frac_of(blanks[b]["variance"]) * n * n for b, n in usage.items()),
+        Fraction(0),
+    )
+    total_variance_exact = variance_exact + blank_variance_exact
+
+    reading_sum = float(reading_exact)
+    variance_sum = float(variance_exact)
+    blank_deduction_total = float(blank_deduction_exact)
+    corrected_mean = float(
+        (reading_exact - blank_deduction_exact) / total_measurements
+    )
+    standard_error = math.sqrt(float(total_variance_exact)) / total_measurements
+
+    # 7) 写入汇总、当时采用的空白样数据快照，以及本汇总的存量聚合缓存。
+    #    旧底稿的补读结果（若有）随本次成功生成一并提交，重启后复用。
     with db:
         cur = db.execute(
             "INSERT INTO summaries "
@@ -442,6 +628,16 @@ def create_summary(body: SummaryRequest, db: Db) -> dict[str, Any]:
                 for b in sorted(usage)
             ],
         )
+        put_aggregate(
+            db, summary_id, reading_exact, variance_exact, usage, backfilled=False
+        )
+        # 旧底稿的补读结果随本次成功生成一并提交（只补读一次），重启后复用
+        for item in backfilled:
+            a = item["agg"]
+            put_aggregate(
+                db, item["summary_id"],
+                a["reading"], a["variance"], a["usage"], backfilled=True,
+            )
     return summary_payload(db, summary_id)
 
 

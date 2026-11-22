@@ -18,6 +18,11 @@
   `PUT /blanks/{id}` 更正。样组登记时不要求空白样已存在。
 - **汇总生成**：凭样组号、已有汇总号或两者组合生成新汇总；重叠样组只计一次。
   引用旧汇总时展开为其样组集合，按**当前**空白样数据重新计算。
+- **续算优化**：请求只引用一份汇总时，直接读取该底稿的成员编号与存量聚合
+  （读数总和、独立测量方差之和、空白样用量），逐组统计只从去重后**新增**的
+  样组读取，不展开底稿样组；引用多份汇总时仍按实际样组展开去重。存量聚合以
+  精确有理数分量保存，续算与“同一批样组从头核算”**位级一致**，读数正负抵消时
+  亦然。升级前生成的汇总首次成功被引用时按其原组补读一次并落盘，重启后复用。
 - **查询旧汇总**：返回原结果与当时采用的空白样数据（快照），不随后续更正改变。
 - **资料缺失**：样组号 / 汇总号 / 空白样任一缺失时，返回 404 并列出所缺编号，
   本次不生成汇总。
@@ -32,6 +37,10 @@
 总方差   = Σ_b 方差_b × n_b²  +  Σ 独立测量方差之和
 标准误   = sqrt(总方差) / N
 ```
+
+所有求和与乘积以精确有理数（Python `fractions.Fraction`，按浮点登记值的二进制
+位值精确表示）合并，仅在写库/返回前正确舍入为 `float`。因此续算结果与用同一批
+样组从头核算的结果完全相等，不受分组顺序或读数正负抵消影响。
 
 ## 启动
 
@@ -55,7 +64,8 @@ uvicorn app.main:app --reload          # 默认数据库 ./data/app.db，可用 
 
 ```bash
 pip install -r requirements-dev.txt
-python3 tests/test_api.py              # 或 pytest tests/
+python3 tests/test_api.py          # 原有端到端测试
+python3 -m pytest tests/           # 全部测试（含续算优化专项）
 ```
 
 ## API 一览
@@ -98,7 +108,8 @@ curl -X PUT localhost:8000/blanks/BLK-A -H 'Content-Type: application/json' -d \
 curl -X POST localhost:8000/summaries -H 'Content-Type: application/json' -d \
   '{"group_ids": ["SG-1", "SG-2"]}'
 
-# 凭已有汇总号 + 新样组继续合并（按当前空白样数据重算，重叠样组只计一次）
+# 凭已有汇总号 + 新样组继续合并（按当前空白样数据重算，重叠样组只计一次；
+# 只引用一份汇总时底稿不展开，逐组统计只读取新增样组）
 curl -X POST localhost:8000/summaries -H 'Content-Type: application/json' -d \
   '{"summary_ids": [1], "group_ids": ["SG-3"]}'
 ```
@@ -151,10 +162,11 @@ curl -X POST localhost:8000/summaries -H 'Content-Type: application/json' -d \
 
 ```
 app/
-  main.py        FastAPI 应用与全部接口
-  db.py          SQLite 连接与建表
+  main.py        FastAPI 应用与全部接口（含续算快路径与精确聚合）
+  db.py          SQLite 连接、建表与缓存表迁移
 tests/
-  test_api.py    端到端测试（覆盖全部业务规则）
+  test_api.py          端到端测试（覆盖全部原有业务规则）
+  test_incremental.py  续算优化专项测试（位级一致、补读、重启复用等）
 Dockerfile
 docker-compose.yml
 requirements.txt
